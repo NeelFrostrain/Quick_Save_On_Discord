@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Quick Save On Discord (.blend → .7z)",
     "author": "Neel Frostrain",
-    "version": (0, 1, 33),
+    "version": (0, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Discord",
-    "description": "Compress .blend to .7z and upload to Discord only on real changes (hash + depsgraph + cooldown)",
+    "description": "Compress .blend to .7z and upload to Discord only when the file actually changes",
     "category": "System",
 }
 
@@ -19,13 +19,6 @@ import json
 import time
 
 # ------------------------------------------------------
-# GLOBAL STATE
-# ------------------------------------------------------
-
-_REAL_CHANGE_DETECTED = False
-_CHANGE_TYPES = set()
-
-# ------------------------------------------------------
 # PATHS
 # ------------------------------------------------------
 
@@ -35,7 +28,7 @@ SEVEN_ZIP_PATH = os.path.join(ADDON_DIR, r"modules\7-Zip\7z.exe")
 PARTIAL_HASH_CHUNK = 2 * 1024 * 1024  # 2 MB
 
 # ------------------------------------------------------
-# PARTIAL HASH (FAST + SAFE)
+# HASH (FAST + SAFE)
 # ------------------------------------------------------
 
 def compute_partial_hash(path):
@@ -52,39 +45,33 @@ def compute_partial_hash(path):
     return h.hexdigest()
 
 # ------------------------------------------------------
-# UI HELPERS (THREAD SAFE)
+# UI HELPERS (SAFE)
 # ------------------------------------------------------
 
 def set_status(text=None):
-    bpy.app.timers.register(lambda: bpy.context.workspace.status_text_set(text))
+    bpy.context.workspace.status_text_set(text)
 
-def clear_status(delay=2.0):
-    bpy.app.timers.register(
-        lambda: bpy.context.workspace.status_text_set(None),
-        first_interval=delay
-    )
+def clear_status():
+    bpy.context.workspace.status_text_set(None)
 
 def report_info(msg):
-    bpy.app.timers.register(
-        lambda: bpy.ops.wm.report(type={'INFO'}, message=msg)
-    )
+    bpy.ops.wm.report(type={'INFO'}, message=msg)
 
 def show_no_change_status():
     report_info("No changes detected — nothing to upload")
     set_status("⏭️ No changes detected — nothing to upload")
-    clear_status(2.0)
 
 def show_cooldown_status(remaining):
     msg = f"⏳ Cooldown active — wait {int(remaining)} sec"
     report_info(msg)
     set_status(msg)
-    clear_status(2.0)
 
 # ------------------------------------------------------
-# PROJECT SETTINGS
+# SETTINGS
 # ------------------------------------------------------
 
 class DiscordProjectSettings(bpy.types.PropertyGroup):
+
     webhook_url: bpy.props.StringProperty(
         name="Webhook URL",
         default="",
@@ -98,7 +85,7 @@ class DiscordProjectSettings(bpy.types.PropertyGroup):
 
     commit_message: bpy.props.StringProperty(
         name="Commit Message",
-        description="Optional commit-style message",
+        description="Optional message",
         default=""
     )
 
@@ -120,18 +107,17 @@ class DiscordProjectSettings(bpy.types.PropertyGroup):
     )
 
 # ------------------------------------------------------
-# COOLDOWN (FIXED — NO BUGS)
+# COOLDOWN (CORRECT)
 # ------------------------------------------------------
 
 def is_cooldown_active(settings):
-    # Never sent before → no cooldown
-    if settings.last_send_time <= 0.0:
+    if settings.last_send_time <= 0:
         return False, 0
 
     if settings.cooldown_seconds <= 0:
         return False, 0
 
-    elapsed = time.monotonic() - settings.last_send_time
+    elapsed = time.time() - settings.last_send_time
     remaining = settings.cooldown_seconds - elapsed
 
     return remaining > 0, max(0, remaining)
@@ -143,28 +129,6 @@ def is_cooldown_active(settings):
 def is_autosave(filepath):
     name = os.path.basename(filepath).lower()
     return "autosave" in name or "quit" in name
-
-# ------------------------------------------------------
-# DEPSGRAPH (REAL USER EDITS)
-# ------------------------------------------------------
-
-def on_depsgraph_update(scene, depsgraph):
-    global _REAL_CHANGE_DETECTED, _CHANGE_TYPES
-
-    if _REAL_CHANGE_DETECTED:
-        return
-
-    for u in depsgraph.updates:
-        if u.is_updated_transform:
-            _CHANGE_TYPES.add("Transform")
-        if u.is_updated_geometry:
-            _CHANGE_TYPES.add("Geometry")
-        if u.is_updated_shading:
-            _CHANGE_TYPES.add("Shading")
-
-        if _CHANGE_TYPES:
-            _REAL_CHANGE_DETECTED = True
-            return
 
 # ------------------------------------------------------
 # CORE
@@ -188,9 +152,7 @@ def compress_blend_7z(filepath):
 def build_commit_message(settings):
     if settings.commit_message.strip():
         return settings.commit_message.strip()
-    if _CHANGE_TYPES:
-        return "Update: " + ", ".join(sorted(_CHANGE_TYPES))
-    return "Update: Scene modified"
+    return "Update: File saved"
 
 def send_to_discord(webhook, archive, message):
     with open(archive, "rb") as f:
@@ -229,8 +191,6 @@ def send_to_discord(webhook, archive, message):
 # ------------------------------------------------------
 
 def process_send(filepath, settings, autosave, current_hash):
-    global _REAL_CHANGE_DETECTED, _CHANGE_TYPES
-
     try:
         set_status("📦 Compressing project...")
         archive = compress_blend_7z(filepath)
@@ -242,23 +202,17 @@ def process_send(filepath, settings, autosave, current_hash):
             build_commit_message(settings)
         )
 
-        def save_state():
-            settings.last_file_hash = current_hash
-            settings.last_send_time = time.monotonic()
-            settings.commit_message = ""
-            _REAL_CHANGE_DETECTED = False
-            _CHANGE_TYPES.clear()
-            return None
-
-        bpy.app.timers.register(save_state)
+        settings.last_file_hash = current_hash
+        settings.last_send_time = time.time()
+        settings.commit_message = ""
 
         if not autosave:
             set_status("✅ Upload complete")
-            clear_status(3.0)
 
     except Exception as e:
         report_info(str(e))
-        clear_status(3.0)
+    finally:
+        clear_status()
 
 # ------------------------------------------------------
 # SAVE HANDLER (ABSOLUTE GATE)
@@ -281,7 +235,7 @@ def on_save_post(dummy):
 
     current_hash = compute_partial_hash(filepath)
 
-    if current_hash == settings.last_file_hash or not _REAL_CHANGE_DETECTED:
+    if current_hash == settings.last_file_hash:
         if not autosave:
             show_no_change_status()
         return
@@ -311,7 +265,7 @@ class DISCORDSEND_OT_SendNow(bpy.types.Operator):
 
         current_hash = compute_partial_hash(filepath)
 
-        if current_hash == settings.last_file_hash or not _REAL_CHANGE_DETECTED:
+        if current_hash == settings.last_file_hash:
             show_no_change_status()
             return {'FINISHED'}
 
@@ -361,11 +315,9 @@ def register():
         type=DiscordProjectSettings
     )
 
-    bpy.app.handlers.depsgraph_update_post.append(on_depsgraph_update)
     bpy.app.handlers.save_post.append(on_save_post)
 
 def unregister():
-    bpy.app.handlers.depsgraph_update_post.remove(on_depsgraph_update)
     bpy.app.handlers.save_post.remove(on_save_post)
     del bpy.types.Scene.discord_project_settings
 
